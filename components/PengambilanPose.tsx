@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { DataPose } from '@/lib/poseUtils';
+import { useVirtualBackground, VirtualBackgroundConfig } from '@/hooks/useVirtualBackground';
 
 // Dynamic import untuk TensorFlow.js (hanya di client)
 // Menggunakan hanya MoveNet untuk menghindari dependency MediaPipe
@@ -12,10 +13,10 @@ async function muatDeteksiPose() {
     // Import hanya bagian yang diperlukan untuk MoveNet
     const tfjs = await import('@tensorflow/tfjs');
     await tfjs.ready();
-    
+
     // Import pose-detection secara dinamis
     const pd = await import('@tensorflow-models/pose-detection');
-    
+
     deteksiPose = {
       SupportedModels: pd.SupportedModels,
       createDetector: pd.createDetector,
@@ -30,6 +31,8 @@ interface PropsPengambilanPose {
   sedangMerekam: boolean;
   lebar?: number;
   tinggi?: number;
+  virtualBackgroundConfig?: VirtualBackgroundConfig;
+  enablePerformanceMode?: boolean;
 }
 
 export default function PengambilanPose({
@@ -37,16 +40,30 @@ export default function PengambilanPose({
   sedangMerekam,
   lebar = 640,
   tinggi = 480,
+  virtualBackgroundConfig,
+  enablePerformanceMode = false,
 }: PropsPengambilanPose) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const detectorRef = useRef<any>(null);
   const [sedangMemuat, setSedangMemuat] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  
+
   // Pastikan width dan height selalu ada nilai default
   const lebarCanvas = lebar ?? 640;
   const tinggiCanvas = tinggi ?? 480;
+
+  // Virtual background hook
+  const defaultVBConfig: VirtualBackgroundConfig = virtualBackgroundConfig || {
+    type: 'none',
+    quality: enablePerformanceMode ? 'low' : 'medium',
+  };
+  const { isLoading: vbLoading, isReady: vbReady, initializeSegmenter, applyBackground } =
+    useVirtualBackground(defaultVBConfig);
+
+  // Performance optimization: Skip frames untuk perangkat lemah
+  const frameSkipCounterRef = useRef(0);
+  const FRAME_SKIP = enablePerformanceMode ? 2 : 0; // Skip 2 frames jika performance mode aktif
 
   useEffect(() => {
     async function initDeteksiPose() {
@@ -57,10 +74,10 @@ export default function PengambilanPose({
           throw new Error('Failed to load pose detection');
         }
 
-        // Initialize MoveNet model - hanya menggunakan Lightning untuk menghindari masalah
+        // Initialize MoveNet model - gunakan Lightning untuk performa lebih baik
         const konfigurasiDetector = {
-          modelType: tf.movenet.modelType.SINGLEPOSE_LIGHTNING, // Gunakan Lightning untuk kompatibilitas lebih baik
-          enableSmoothing: true,
+          modelType: tf.movenet.modelType.SINGLEPOSE_LIGHTNING,
+          enableSmoothing: !enablePerformanceMode, // Disable smoothing untuk performa
           minPoseScore: 0.25,
         };
 
@@ -70,12 +87,24 @@ export default function PengambilanPose({
         );
 
         detectorRef.current = detector;
+
+        // Initialize virtual background jika diperlukan
+        if (defaultVBConfig.type !== 'none') {
+          await initializeSegmenter();
+        }
+
         setSedangMemuat(false);
 
-        // Start webcam
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: lebarCanvas, height: tinggiCanvas },
-        });
+        // Start webcam dengan resolusi yang disesuaikan untuk performance mode
+        const constraints = {
+          video: {
+            width: enablePerformanceMode ? Math.min(lebarCanvas, 480) : lebarCanvas,
+            height: enablePerformanceMode ? Math.min(tinggiCanvas, 360) : tinggiCanvas,
+            frameRate: enablePerformanceMode ? { ideal: 24, max: 30 } : { ideal: 30 },
+          },
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -96,7 +125,7 @@ export default function PengambilanPose({
         stream.getTracks().forEach((track) => track.stop());
       }
     };
-  }, [lebarCanvas, tinggiCanvas]);
+  }, [lebarCanvas, tinggiCanvas, enablePerformanceMode, defaultVBConfig.type, initializeSegmenter]);
 
   // Use ref untuk callback agar tidak menyebabkan re-render
   const onPoseTerdeteksiRef = useRef(onPoseTerdeteksi);
@@ -115,11 +144,7 @@ export default function PengambilanPose({
     let animationFrameId: number;
 
     async function gambarVideo() {
-      if (
-        !videoRef.current ||
-        !canvasRef.current ||
-        sedangMemuat
-      ) {
+      if (!videoRef.current || !canvasRef.current || sedangMemuat) {
         animationFrameId = requestAnimationFrame(gambarVideo);
         return;
       }
@@ -133,63 +158,75 @@ export default function PengambilanPose({
         return;
       }
 
+      // Frame skipping untuk performance mode
+      if (FRAME_SKIP > 0) {
+        frameSkipCounterRef.current++;
+        if (frameSkipCounterRef.current < FRAME_SKIP) {
+          animationFrameId = requestAnimationFrame(gambarVideo);
+          return;
+        }
+        frameSkipCounterRef.current = 0;
+      }
+
       try {
-        // Always draw video frame FIRST (webcam selalu terlihat, tidak terblokir)
-        ctx.drawImage(video, 0, 0, lebarCanvas, tinggiCanvas);
+        // Apply virtual background atau draw video langsung
+        if (defaultVBConfig.type !== 'none' && vbReady) {
+          await applyBackground(video, canvas, ctx);
+        } else {
+          // Fallback: draw video frame langsung
+          ctx.drawImage(video, 0, 0, lebarCanvas, tinggiCanvas);
+        }
 
         // Pose detection di background - tidak memblokir video drawing
-        // Gunakan ref untuk check tanpa dependency
         if (sedangMerekamRef.current && detectorRef.current) {
           // Process pose detection asynchronously tanpa memblokir video
-          detectorRef.current.estimatePoses(video).then((poses) => {
-            if (poses && poses.length > 0) {
-              const pose = poses[0];
-              
-              // Draw keypoints dan skeleton di frame berikutnya untuk tidak mengganggu
-              requestAnimationFrame(() => {
-                if (ctx && video.readyState === video.HAVE_ENOUGH_DATA) {
-                  // Redraw video untuk memastikan keypoints di layer yang benar
-                  ctx.drawImage(video, 0, 0, lebarCanvas, tinggiCanvas);
-                  
-                  // Draw keypoints
-                  gambarKeypoints(ctx, pose.keypoints);
-                  // Draw skeleton
-                  gambarSkeleton(ctx, pose.keypoints);
-                }
+          detectorRef.current
+            .estimatePoses(video)
+            .then((poses) => {
+              if (poses && poses.length > 0) {
+                const pose = poses[0];
 
-                // Convert to DataPose format
-                const dataPose: DataPose = {
-                  keypoints: pose.keypoints.map((kp) => ({
-                    x: kp.x,
-                    y: kp.y,
-                    z: kp.z,
-                    score: kp.score,
-                    name: kp.name,
-                  })),
-                  score: pose.score,
-                };
+                // Draw keypoints dan skeleton
+                requestAnimationFrame(() => {
+                  if (ctx && video.readyState === video.HAVE_ENOUGH_DATA) {
+                    // Draw keypoints
+                    gambarKeypoints(ctx, pose.keypoints);
+                    // Draw skeleton
+                    gambarSkeleton(ctx, pose.keypoints);
+                  }
 
-                // Throttle callback untuk mencegah terlalu banyak calls bersamaan
-                const sekarang = Date.now();
-                if (sekarang - waktuCallbackTerakhirRef.current >= THROTTLE_MS) {
-                  waktuCallbackTerakhirRef.current = sekarang;
-                  // Use ref untuk memanggil callback (proses di background)
-                  onPoseTerdeteksiRef.current(dataPose);
-                }
-              });
-            } else {
-              // Jangan throttle null callback - selalu pass untuk clear state
-              onPoseTerdeteksiRef.current(null);
-            }
-          }).catch((err) => {
-            console.error('Error detecting pose:', err);
-          });
+                  // Convert to DataPose format
+                  const dataPose: DataPose = {
+                    keypoints: pose.keypoints.map((kp) => ({
+                      x: kp.x,
+                      y: kp.y,
+                      z: kp.z,
+                      score: kp.score,
+                      name: kp.name,
+                    })),
+                    score: pose.score,
+                  };
+
+                  // Throttle callback untuk mencegah terlalu banyak calls
+                  const sekarang = Date.now();
+                  if (sekarang - waktuCallbackTerakhirRef.current >= THROTTLE_MS) {
+                    waktuCallbackTerakhirRef.current = sekarang;
+                    onPoseTerdeteksiRef.current(dataPose);
+                  }
+                });
+              } else {
+                onPoseTerdeteksiRef.current(null);
+              }
+            })
+            .catch((err) => {
+              console.error('Error detecting pose:', err);
+            });
         }
       } catch (err) {
         console.error('Error drawing video:', err);
       }
 
-      // Always continue drawing video (tidak terblokir oleh pose detection)
+      // Always continue drawing video
       animationFrameId = requestAnimationFrame(gambarVideo);
     }
 
@@ -202,9 +239,8 @@ export default function PengambilanPose({
         cancelAnimationFrame(animationFrameId);
       }
     };
-    // Dependency array harus selalu konsisten - hanya 3 item
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sedangMemuat, lebarCanvas, tinggiCanvas]); // sedangMerekam sengaja tidak dimasukkan karena menggunakan ref
+  }, [sedangMemuat, lebarCanvas, tinggiCanvas, defaultVBConfig.type, vbReady, applyBackground]);
 
   function gambarKeypoints(
     ctx: CanvasRenderingContext2D,

@@ -7,9 +7,13 @@ import PengambilanPose from './PengambilanPose';
 import PratinjauModel from './PratinjauModel';
 import OverlaySkor from './OverlaySkor';
 import IndikatorWaktu from './IndikatorWaktu';
+import BackgroundSelector from './BackgroundSelector';
+import PerformanceSettings from './PerformanceSettings';
 import { usePoseReferensi } from '@/hooks/usePoseReferensi';
 import { useKunciSkor } from '@/hooks/useKunciSkor';
 import { usePenilaianPose } from '@/hooks/usePenilaianPose';
+import { VirtualBackgroundConfig } from '@/hooks/useVirtualBackground';
+import { PerformanceLevel, getPerformanceConfig } from '@/lib/performanceConfig';
 import { KECEPATAN_INDIKATOR_WAKTU, DURASI_PENILAIAN } from '@/constants/penilaian';
 
 export default function PenilaianUtama() {
@@ -17,6 +21,24 @@ export default function PenilaianUtama() {
   const poseReferensi = usePoseReferensi();
   const [sudahMulai, setSudahMulai] = useState(false);
   const [hitungMundur, setHitungMundur] = useState<number | null>(null);
+
+  // State untuk performance level
+  const [performanceLevel, setPerformanceLevel] = useState<PerformanceLevel>('medium');
+  const performanceConfig = getPerformanceConfig(performanceLevel);
+
+  // State untuk virtual background
+  const [virtualBackgroundConfig, setVirtualBackgroundConfig] = useState<VirtualBackgroundConfig>({
+    type: 'none',
+    quality: performanceConfig.vbQuality,
+  });
+
+  // Update virtual background quality ketika performance level berubah
+  useEffect(() => {
+    setVirtualBackgroundConfig((prev) => ({
+      ...prev,
+      quality: performanceConfig.vbQuality,
+    }));
+  }, [performanceConfig.vbQuality]);
 
   const {
     skorTampilan,
@@ -116,6 +138,8 @@ export default function PenilaianUtama() {
                   <PengambilanPose
                     onPoseTerdeteksi={handlePoseTerdeteksi}
                     sedangMerekam={sudahMulai}
+                    virtualBackgroundConfig={virtualBackgroundConfig}
+                    enablePerformanceMode={performanceLevel === 'low'}
                   />
                   {hitungMundur !== null && skorTampilan === null && (
                     <div className="absolute top-4 left-4 bg-black/80 backdrop-blur-sm px-6 py-4 rounded-lg z-30 border-2 border-yellow-400/30">
@@ -198,6 +222,21 @@ export default function PenilaianUtama() {
               </div>
             )}
           </div>
+        </div>
+
+        {/* Settings Panel */}
+        <div className="space-y-4">
+          {/* Performance Settings */}
+          <PerformanceSettings
+            currentLevel={performanceLevel}
+            onLevelChange={setPerformanceLevel}
+          />
+
+          {/* Virtual Background Selector */}
+          <BackgroundSelector
+            currentConfig={virtualBackgroundConfig}
+            onConfigChange={setVirtualBackgroundConfig}
+          />
         </div>
       </div>
     </div>
